@@ -59,7 +59,7 @@ def simulate_mnlogit(
             y[flips] = r + (r >= yf)
 
     df = pd.DataFrame(X, columns=[f"X{j}" for j in range(p)])
-    df["Y"] = y + 1
+    df["Y"] = y 
     if return_probas:
         for k in range(K): df[f"p{k}"] = P[:, k]
 
