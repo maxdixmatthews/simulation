@@ -1,6 +1,9 @@
 import numpy as np
 import pandas as pd
 from scipy.special import softmax
+import statsmodels.api as sm
+import zlib
+from numpy.random import Generator, PCG64
 
 def simulate_mnlogit(
     n_samples: int,
@@ -65,3 +68,81 @@ def simulate_mnlogit(
 
     params = {"W": W, "b": b, "seed_used": seed}
     return df, params
+
+def generate_column(hashed_seed, n_samples):
+    # Select distribution type randomly between normal, poisson, gamma
+    rg = Generator(PCG64(hashed_seed))
+    dist_type = rg.choice(['normal', 'poisson', 'gamma', 'laplace'])
+    if dist_type == 'normal':
+        # change all params to be a dictionary
+        # select mean and stddev randomly skewed towards lower values
+        mean = rg.normal(loc=0, scale=2)
+        stddev = rg.exponential(scale=1)
+        params = (np.around(mean,2), np.around(stddev,2))
+        samples =  rg.normal(loc=mean, scale=stddev, size=n_samples)
+    elif dist_type == 'poisson':
+        # select lambda randomly skewed towards lower values and positive
+        lam = rg.exponential(scale=4)
+        params = (np.around(lam,2),)
+        samples = rg.poisson(lam=lam, size=n_samples)
+    elif dist_type == 'gamma':
+        # select shape and scale randomly skewed towards lower values and positive
+        shape = rg.exponential(scale=2)
+        scale = rg.exponential(scale=1)
+        params = (np.around(shape,2), np.around(scale,2))
+        samples = rg.gamma(shape=shape, scale=scale, size=n_samples)
+    elif dist_type == 'laplace':
+        mean = rg.normal(loc=0, scale=1)
+        scale = rg.exponential(scale=1)
+        params = (np.around(mean,2), np.around(scale,2))
+        samples = rg.laplace(loc=mean, scale=scale, size=n_samples)
+    return dist_type + f"{params}", np.around(samples, 2)
+
+def generate_mlr_data(seed, n_features, n_samples, n_classes, cov_beta, intercepts):
+    np.set_printoptions(legacy='1.25')
+    hashed_seed = int(zlib.crc32((seed*n_features).to_bytes(8, "big")))
+    X = np.empty((n_samples, n_features))
+    dist_types = []
+    for i in range(0,n_features): 
+        hashed_seed = int(zlib.crc32((hashed_seed+1).to_bytes(8, "big")))
+        dist_type, new_col = generate_column(hashed_seed, n_samples)
+        X[:, i] = new_col
+        print(f"Col{i+1}: {dist_type}")
+        dist_types.append(f"Col{i+1}: {dist_type}")
+
+    w = np.array(cov_beta)  
+
+    b = np.array(intercepts)[None, :].T            # scalar intercept
+
+    X_new = X                    # shape (n, p)
+    X_new_c = sm.add_constant(X_new) # adds intercept column as first col
+
+    # Build a dummy GLM just so we can use its predict; no fitting
+    glm = sm.GLM(endog=np.arange(n_classes), exog=np.zeros((n_classes, X_new_c.shape[1])))
+
+    beta = np.hstack([b, w]).T          # shape (p+1, K-1)
+    S = glm.predict(params=beta, exog=X_new_c)  # shape (n,)
+
+    row_max = np.maximum(0.0, S.max(axis=1, keepdims=True))  # include baseline (0) in the max
+    exp_non_baseline   = np.exp(S - row_max)                             # non-baseline terms
+    base    = np.exp(-row_max)                                # baseline term (exp(0 - row_max))
+    denom   = base + exp_non_baseline.sum(axis=1, keepdims=True)
+
+    P_nonbase = exp_non_baseline / denom
+    P_base    = base  / denom
+    proba     = np.concatenate([P_base, P_nonbase], axis=1)   
+    y_hat = proba.argmax(axis=1)    
+    y = y_hat
+    counts = np.bincount(y_hat, minlength=4)      # a is your 1D array of 0/1/2/3
+    freq   = counts / counts.sum()
+    return X, y, dist_types, proba, freq
+
+def check_hashes(X, y, x_hash, y_hash, full_hash):
+    full_dataset = np.column_stack((X, y))
+    full_dataset_hash = int(zlib.crc32(full_dataset.tobytes()))
+    if int(zlib.crc32(X.tobytes())) != x_hash:
+        raise ValueError(f"X hash mismatch: {int(zlib.crc32(X.tobytes()))} != {x_hash}")
+    if int(zlib.crc32(y.tobytes())) != y_hash:
+        raise ValueError(f"y hash mismatch: {int(zlib.crc32(y.tobytes()))} != {y_hash}")
+    if full_dataset_hash != full_hash:
+        raise ValueError(f"Full dataset hash mismatch: {full_dataset_hash} != {full_hash}")
