@@ -95,7 +95,7 @@ def generate_mlr_data(seed, n_features, n_samples, n_classes, cov_beta, intercep
     proba     = np.concatenate([P_base, P_nonbase], axis=1)   
 
     # rg = np.random.default_rng(seed)
-    y_hat = np.array([rg.choice(proba.shape[1], p=row) for row in proba])  # shape (10,)
+    y_hat = np.array([rg.choice(proba.shape[1], p=row) for row in proba], dtype=np.int64)  # shape (10,)
     # y_hat = proba.argmax(axis=1)
     y = y_hat
     counts = np.bincount(y_hat, minlength=n_classes)      
