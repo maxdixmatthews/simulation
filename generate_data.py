@@ -182,3 +182,79 @@ def newick(obj):
         L, R = by[S]
         return f"({rec(L)},{rec(R)})"
     return rec(U) + ";"
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+def generate_nd_data(seed, n_features, n_samples, n_classes, cov_list, nd_structure, nd_params=None, extra_conditions=None):
+    np.set_printoptions(legacy='1.21')
+    covariates_list = cov_list
+    if nd_params is not None:
+        nd_structure = list(nd_params.keys())
+        covariates_list = list(nd_params.values())
+        nd_node_desc = {}
+        for index, i in enumerate(nd_structure):
+            combined = tuple(sorted(i[0] + i[1]))
+            nd_node_desc[combined] = i
+    else:
+        nd_params = {}
+        nd_node_desc = {}
+        for index, i in enumerate(nd_structure):
+            nd_params[i] = covariates_list[index]
+            combined = tuple(sorted(i[0] + i[1]))
+            nd_node_desc[combined] = i
+
+    hashed_seed = int(zlib.crc32((seed*n_features).to_bytes(8, "big")))
+    rg = Generator(PCG64(hashed_seed))
+    X = np.empty((n_samples, n_features))
+    dist_types = []
+    new_col = None
+    for i in range(0,n_features): 
+        hashed_seed = int(zlib.crc32((hashed_seed+1).to_bytes(8, "big")))
+        dist_type, new_col = generate_column(hashed_seed, n_samples, new_col, extra_conditions)
+        X[:, i] = new_col
+        dist_types.append(f"Col{i+1}: {dist_type}")
+        
+    columns = [f'p{i}' for i in range(n_features)]
+    df = pd.DataFrame(X, columns=columns)
+
+    Y = []
+    for index, row in df.iterrows():
+        mutliplyer = [1.0] + row.tolist()
+        curr_layer = nd_structure[0]
+        while(True):
+            cov = nd_params.get(curr_layer)
+            res = np.array(cov, dtype=float) * np.array(mutliplyer)
+            bern_input = sigmoid(sum(res))
+            bern_output = rg.binomial(1, bern_input)
+            node_winner = curr_layer[bern_output]
+            curr_layer = nd_node_desc.get(node_winner, node_winner)
+            if curr_layer not in nd_params: 
+                Y.append(curr_layer[0])
+                break
+
+    counts = np.bincount(Y, minlength=n_classes)      
+    freq   = counts / counts.sum()
+
+    return X, np.array(Y), dist_types, freq
+
+def bfs_splits(tree):
+    # normalise each split: sort labels; bigger side left (tie → lexicographic)
+    S = [ (tuple(sorted(L)), tuple(sorted(R))) for (L,R) in tree ]
+    print(S)
+    S = [ (max(a,b, key=lambda t:(len(t), t)), min(a,b, key=lambda t:(len(t), t))) for a,b in S ]
+
+    # map subset → split; find root label set
+    by = { frozenset((*L, *R)): (L, R) for (L, R) in S }
+    root = set().union(*[ set(L)|set(R) for (L,R) in S ])
+
+    # BFS order
+    out, q = [], deque([root])
+    while q:
+        U = q.popleft()
+        if len(U) <= 1: 
+            continue
+        L, R = by[frozenset(U)]
+        out.append((L, R))
+        q.append(set(L)); q.append(set(R))
+    return tuple(out)
