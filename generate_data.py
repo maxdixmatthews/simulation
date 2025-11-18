@@ -4,6 +4,7 @@ from scipy.special import softmax
 import statsmodels.api as sm
 import zlib
 from numpy.random import Generator, PCG64
+from sklearn.model_selection import train_test_split
 
 def generate_column(hashed_seed, n_samples, new_col=None, extra_conditions=""):
     # Select distribution type randomly between normal, poisson, gamma
@@ -238,10 +239,42 @@ def generate_nd_data(seed, n_features, n_samples, n_classes, cov_list, nd_struct
 
     return X, np.array(Y), dist_types, freq
 
+def all_nd_data(row):
+    dataset_name = row['name']
+    simulation_id = row['simulation_id']
+    seed = int(float(row['seed']))
+    n_samples = int(float(row['n_samples']))
+    n_classes = int(row['n_classes'])
+    n_features = int(row['n_features'])
+    x_hash = int(row['x_hash'])
+    y_hash = int(row['y_hash'])
+    full_dataset_hash = int(row['full_dataset_hash'])
+    extra_conditions = str(row['extra_condition'])
+    cov = ast.literal_eval(row['covariates'])
+    nd_structure = ast.literal_eval(row['generated_nd'])
+    nd_params = ast.literal_eval(row['nd_params'])
+
+    best_prev_tree = tuple(bfs_splits(tuple(nd_structure)))
+
+    X, y, dist_types, freq = generate_nd_data(seed, n_features, n_samples, n_classes, cov, nd_structure, nd_params=nd_params, extra_conditions=extra_conditions)
+    # gd.check_hashes(X, y, x_hash, y_hash, full_dataset_hash)
+    df = pd.DataFrame(X, columns=[f"p{i+1}" for i in range(n_features)])
+    # df['Y'] = y
+    X, X_test, y, y_test = train_test_split(df, y, test_size=0.2, random_state=seed)
+
+    categories = tuple(np.unique(y))
+    return_dict = {
+        "X": X, 
+        "y": y,
+        "categories": categories,
+        "X_test": X_test,
+        "y_test":y_test
+    }
+    return return_dict
+    
 def bfs_splits(tree):
     # normalise each split: sort labels; bigger side left (tie → lexicographic)
     S = [ (tuple(sorted(L)), tuple(sorted(R))) for (L,R) in tree ]
-    print(S)
     S = [ (max(a,b, key=lambda t:(len(t), t)), min(a,b, key=lambda t:(len(t), t))) for a,b in S ]
 
     # map subset → split; find root label set
