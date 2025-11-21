@@ -30,8 +30,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.manifold import MDS
 from sklearn.cluster import KMeans
 from statsmodels.tools.sm_exceptions import PerfectSeparationError, ConvergenceWarning
-
-global cache
+import config
 
 def v2_defined_all_trees(n: int):
     """Return a list of all ND trees over labels 0..n-1 (each tree is a tuple of splits)."""
@@ -72,7 +71,7 @@ def tree_signatures(tree):
     """
     return frozenset(_canon_split(a, b) for (a, b) in tree)
 
-def split_loglik_star_sm(X, y, split, maxiter=200, eps=1e-12):
+def split_loglik_star_sm(X, y, split, maxiter=2000, eps=1e-12):
     """
     ℓ*(split) using statsmodels Logit (unpenalized MLE).
     Returns the node log-likelihood at the MLE (float).
@@ -89,8 +88,9 @@ def split_loglik_star_sm(X, y, split, maxiter=200, eps=1e-12):
 
     try: 
         # Direct log-likelihood at the MLE:
-        lr = LogisticRegression(penalty=None, solver="newton-cholesky", max_iter=maxiter)
+        lr = LogisticRegression(penalty="l2", C=0.1, solver="newton-cholesky", max_iter=maxiter, fit_intercept=True)
         lr.fit(X[mask], s)
+        config.model_cache[split] = lr
         p = lr.predict_proba(X[mask])[:, 1]
         return float(-log_loss(s, p, normalize=False))
     except PerfectSeparationError:
@@ -111,18 +111,18 @@ def delta_loglik(X, y, sig_T, sig_Tstar):
     rem_vals = []
     
     for s in add:
-        if s not in cache:
+        if s not in config.cache:
             log_lik = split_loglik_star_sm(X, y, s)
-            cache[s] = log_lik
+            config.cache[s] = log_lik
         else: 
-            log_lik = cache[s]
+            log_lik = config.cache[s]
         add_vals.append(log_lik)
     for s in rem:
-        if s not in cache:
+        if s not in config.cache:
             log_lik = split_loglik_star_sm(X, y, s)
-            cache[s] = log_lik
+            config.cache[s] = log_lik
         else: 
-            log_lik = cache[s]
+            log_lik = config.cache[s]
         rem_vals.append(log_lik)
     
     return sum(add_vals) - sum(rem_vals)
@@ -245,9 +245,9 @@ def tree_loglik(X, y, T):
 # sum node log-likelihoods (cached), using existing split scorer
     s = 0.0
     for split in T:
-        if split not in cache:
-            cache[split] = split_loglik_star_sm(X, y, split)
-        s += cache[split]
+        if split not in config.cache:
+            config.cache[split] = split_loglik_star_sm(X, y, split)
+        s += config.cache[split]
     return s
 
 def local_swap(T, rg):
@@ -400,7 +400,7 @@ def mh_dep_non_unif_node_trees(X, y, n_samples, categories, rng_seed=42, alpha =
         if np.log(rng.random()) < min(0.0, logR):
             T = T_star
         trace[t] = T
-    return trace, all_tested_trees, cache
+    return trace, all_tested_trees, config.cache
 
 def mh_dep_non_unif_simmulated_annealing(X, y, n_samples, categories, rng_seed=42, start_beta=0.05, end_beta=1.1, alpha = 0.5, eta_thresh=0.5):
     """
@@ -412,7 +412,7 @@ def mh_dep_non_unif_simmulated_annealing(X, y, n_samples, categories, rng_seed=4
     rng = Generator(PCG64(rng_seed))
 
     T = tuple(init_tree_n(categories, rng))
-    T = tuple(gd.breadth_first_splits(T))
+    T = tuple(gd.bfs_splits(T))
     trace = np.empty(n_samples, dtype=object)
     all_tested_trees = set()
     all_tested_trees.add(T)
@@ -433,7 +433,7 @@ def mh_dep_non_unif_simmulated_annealing(X, y, n_samples, categories, rng_seed=4
         if np.log(rng.random()) < min(0.0, logR):
             T = T_star
         trace[t] = T
-    return trace, all_tested_trees, cache
+    return trace, all_tested_trees, config.cache
 
 def check_label_fit(labels, y, coords):
 
@@ -692,7 +692,7 @@ def html_similarity_scatter(df, embeding="newick", ngram_range=(2,4), n_clusters
 
     return S, coords
 
-def viz_mh_trace(traces, burn=0, top_k=20, html_path=None, best_known=None, loglik_fn=None, notes=""):
+def viz_mh_trace(traces, X, y, burn=0, top_k=20, html_path=None, best_known=None, loglik_fn=None, notes=""):
     try: L = min(len(t) for t in traces); arr = np.stack([np.asarray(t[:L], object) for t in traces], 0)
     except Exception: arr = np.asarray(traces, object)[None, :]
 
@@ -710,7 +710,7 @@ def viz_mh_trace(traces, burn=0, top_k=20, html_path=None, best_known=None, logl
     labels = [str(int(i)) for i in top_ids]
     top_trees = [uniq_trees[int(i)] for i in top_ids]
 
-    _ll = (lambda T: float(loglik_fn(T))) if loglik_fn else (lambda T: None)
+    _ll = (lambda T: float(loglik_fn(X, y, T))) if loglik_fn else (lambda T: None)
     bk_ll = _ll(best_known) if (best_known is not None) else None
     top_lls = [_ll(T) for T in top_trees]
     if loglik_fn and any(ll is not None for ll in top_lls):

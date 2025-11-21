@@ -5,6 +5,7 @@ import statsmodels.api as sm
 import zlib
 from numpy.random import Generator, PCG64
 from sklearn.model_selection import train_test_split
+import json
 
 def generate_column(hashed_seed, n_samples, new_col=None, extra_conditions=""):
     # Select distribution type randomly between normal, poisson, gamma
@@ -268,10 +269,43 @@ def all_nd_data(row):
         "y": y,
         "categories": categories,
         "X_test": X_test,
-        "y_test":y_test
+        "y_test":y_test,
+        "best_prev_tree":best_prev_tree
     }
     return return_dict
-    
+
+def all_non_nd(row):
+    dataset_name = row['name']
+    simulation_id = row['simulation_id']
+    seed = int(float(row['seed']))
+    n_samples = int(float(row['n_samples']))
+    n_classes = int(row['n_classes'])
+    n_features = int(row['n_features'])
+    cov_beta = json.loads(row['covariates'])
+    intercepts = json.loads(row['intercept'])
+    x_hash = int(row['x_hash'])
+    y_hash = int(row['y_hash'])
+    full_dataset_hash = int(row['full_dataset_hash'])
+    extra_conditions = str(row['extra_condition'])
+    # given_best_tree = row['selected_tree']
+    test_size = 0.2
+
+    best_prev_tree = None
+
+    X, y, dist_types, proba, freq = generate_mlr_data(seed, n_features, n_samples, n_classes, cov_beta, intercepts, extra_conditions=extra_conditions)
+    df = pd.DataFrame(X, columns=[f"p{i+1}" for i in range(n_features)])
+    X, X_test, y, y_test = train_test_split(df, y, test_size=test_size, random_state=seed)
+
+    categories = tuple(np.unique(y))
+    return_dict = {
+        "X": X, 
+        "y": y,
+        "categories": categories,
+        "X_test": X_test,
+        "y_test":y_test,
+        "best_prev_tree":best_prev_tree
+    }
+    return return_dict
 def bfs_splits(tree):
     # normalise each split: sort labels; bigger side left (tie → lexicographic)
     S = [ (tuple(sorted(L)), tuple(sorted(R))) for (L,R) in tree ]
