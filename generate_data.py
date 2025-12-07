@@ -5,7 +5,11 @@ import statsmodels.api as sm
 import zlib
 from numpy.random import Generator, PCG64
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import (accuracy_score, roc_curve, precision_recall_curve, classification_report, confusion_matrix, precision_score, recall_score,
+                             f1_score, roc_auc_score, log_loss, balanced_accuracy_score,
+                             cohen_kappa_score, matthews_corrcoef, jaccard_score, hamming_loss)
 import json
+import sqlalchemy as sa
 
 def generate_column(hashed_seed, n_samples, new_col=None, extra_conditions=""):
     # Select distribution type randomly between normal, poisson, gamma
@@ -162,18 +166,43 @@ def depth_first_splits(obj):
     dfs(U)
     return out
 
-def breadth_first_splits(obj):
-    """Level-order list of splits as ((left tuple),(right tuple))."""
-    by, U = _parse_tree(obj)
-    out, q = [], deque([U])
+# def breadth_first_splits(obj):
+#     """Level-order list of splits as ((left tuple),(right tuple))."""
+#     by, U = _parse_tree(obj)
+#     out, q = [], deque([U])
+#     while q:
+#         S = q.popleft()
+#         if len(S) == 1: continue
+#         if S not in by: raise ValueError(f"Missing split for subset {tuple(sorted(S))}.")
+#         L, R = by[S]
+#         out.append((tuple(sorted(L)), tuple(sorted(R))))
+#         q.append(L); q.append(R)
+#     return out
+
+
+def bfs_splits(tree):
+    # normalise splits: ints, sorted, bigger side left
+    norm = []
+    for L, R in tree:
+        L = tuple(sorted(int(c) for c in L))
+        R = tuple(sorted(int(c) for c in R))
+        if (len(R), R) > (len(L), L):
+            L, R = R, L
+        norm.append((L, R))
+
+    by = {frozenset(L + R): (L, R) for (L, R) in norm}
+    root = set().union(*(set(L) | set(R) for (L, R) in norm))
+
+    out, q = [], deque([root])
     while q:
-        S = q.popleft()
-        if len(S) == 1: continue
-        if S not in by: raise ValueError(f"Missing split for subset {tuple(sorted(S))}.")
-        L, R = by[S]
-        out.append((tuple(sorted(L)), tuple(sorted(R))))
-        q.append(L); q.append(R)
-    return out
+        U = q.popleft()
+        if len(U) <= 1:
+            continue
+        L, R = by[frozenset(U)]
+        out.append((L, R))
+        q.append(set(L))
+        q.append(set(R))
+    return tuple(out)
 
 def newick(obj):
     """Newick string '(left,right);' with leaf labels."""
@@ -306,22 +335,112 @@ def all_non_nd(row):
         "best_prev_tree":best_prev_tree
     }
     return return_dict
-def bfs_splits(tree):
-    # normalise each split: sort labels; bigger side left (tie → lexicographic)
-    S = [ (tuple(sorted(L)), tuple(sorted(R))) for (L,R) in tree ]
-    S = [ (max(a,b, key=lambda t:(len(t), t)), min(a,b, key=lambda t:(len(t), t))) for a,b in S ]
 
-    # map subset → split; find root label set
-    by = { frozenset((*L, *R)): (L, R) for (L, R) in S }
-    root = set().union(*[ set(L)|set(R) for (L,R) in S ])
+# def bfs_splits(tree):
+#     # normalise each split: sort labels; bigger side left (tie → lexicographic)
+#     S = [ (tuple(sorted(L)), tuple(sorted(R))) for (L,R) in tree ]
+#     S = [ (max(a,b, key=lambda t:(len(t), t)), min(a,b, key=lambda t:(len(t), t))) for a,b in S ]
 
-    # BFS order
-    out, q = [], deque([root])
-    while q:
-        U = q.popleft()
-        if len(U) <= 1: 
-            continue
-        L, R = by[frozenset(U)]
-        out.append((L, R))
-        q.append(set(L)); q.append(set(R))
-    return tuple(out)
+#     # map subset → split; find root label set
+#     by = { frozenset((*L, *R)): (L, R) for (L, R) in S }
+#     root = set().union(*[ set(L)|set(R) for (L,R) in S ])
+
+#     # BFS order
+#     out, q = [], deque([root])
+#     while q:
+#         U = q.popleft()
+#         if len(U) <= 1: 
+#             continue
+#         L, R = by[frozenset(U)]
+#         out.append((L, R))
+#         q.append(set(L)); q.append(set(R))
+#     return tuple(out)
+
+def calculate_metrics(config, y_true, y_pred):
+    """
+    """
+    confusion_matrix_ls = str(confusion_matrix(y_true, y_pred))
+    accuracy = accuracy_score(y_true, y_pred)
+    precision_macro = precision_score(y_true, y_pred, average='macro')
+    precision_micro = precision_score(y_true, y_pred, average='micro')
+    recall_macro = recall_score(y_true, y_pred, average='macro')
+    recall_micro = recall_score(y_true, y_pred, average='micro')
+    f1_macro = f1_score(y_true, y_pred, average='macro')
+    f1_micro = f1_score(y_true, y_pred, average='micro')
+    balanced_accuracy = balanced_accuracy_score(y_true, y_pred)
+    cohen_kappa = cohen_kappa_score(y_true, y_pred)
+    matthews_corr_coef = matthews_corrcoef(y_true, y_pred)
+    jaccard_macro = jaccard_score(y_true, y_pred, average='macro')
+    hamming_loss_db = hamming_loss(y_true, y_pred)
+    
+    metrics_dict = {
+        "accuracy":[accuracy],        
+        "precision_macro":[precision_macro], 
+        "precision_micro":[precision_micro], 
+        "recall_macro":[recall_macro], 
+        "recall_micro":[recall_micro], 
+        "f1_macro":[f1_macro], 
+        "f1_micro":[f1_micro], 
+        "balanced_accuracy":[balanced_accuracy], 
+        "cohen_kappa":[cohen_kappa], 
+        "matthews_corrcoef":[matthews_corr_coef], 
+        "jaccard_macro":[jaccard_macro], 
+        "hamming_loss":[hamming_loss_db], 
+        "confusion_matrix":[confusion_matrix_ls],
+    }
+    return pd.DataFrame(metrics_dict)
+
+def df_upsert_postgres(data_frame, table_name, engine, schema=None, match_columns=None, insert_only=False):
+    """
+    Perform an "upsert" on a PostgreSQL table from a DataFrame.
+    Constructs an INSERT … ON CONFLICT statement, uploads the DataFrame to a
+    temporary table, and then executes the INSERT.
+    Parameters
+    ----------
+    data_frame : pandas.DataFrame
+        The DataFrame to be upserted.
+    table_name : str
+        The name of the target table.
+    engine : sqlalchemy.engine.Engine
+        The SQLAlchemy Engine to use.
+    schema : str, optional
+        The name of the schema containing the target table.
+    match_columns : list of str, optional
+        A list of the column name(s) on which to match. If omitted, the
+        primary key columns of the target table will be used.
+    insert_only : bool, optional
+        On conflict do not update. (Default: False)
+    """
+    table_spec = ""
+    if schema:
+        table_spec += '"' + schema.replace('"', '""') + '".'
+    table_spec += '"' + table_name.replace('"', '""') + '"'
+
+    df_columns = list(data_frame.columns)
+    if not match_columns:
+        insp = sa.inspect(engine)
+        match_columns = insp.get_pk_constraint(table_name, schema=schema)[
+            "constrained_columns"
+        ]
+    columns_to_update = [col for col in df_columns if col not in match_columns]
+    insert_col_list = ", ".join([f'"{col_name}"' for col_name in df_columns])
+    stmt = f"INSERT INTO {table_spec} ({insert_col_list})\n"
+    stmt += f"SELECT {insert_col_list} FROM temp_table\n"
+    match_col_list = ", ".join([f'"{col}"' for col in match_columns])
+    stmt += f"ON CONFLICT ({match_col_list}) DO "
+    if insert_only:
+        stmt += "NOTHING"
+    else:
+        stmt += "UPDATE SET\n"
+        stmt += ", ".join(
+            [f'"{col}" = EXCLUDED."{col}"' for col in columns_to_update]
+        )
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DROP TABLE IF EXISTS temp_table")
+        conn.exec_driver_sql(
+            f"CREATE TEMPORARY TABLE temp_table AS SELECT * FROM {table_spec} WHERE false"
+        )
+        data_frame.to_sql("temp_table", conn, if_exists="append", index=False)
+        conn.exec_driver_sql(stmt)
+   

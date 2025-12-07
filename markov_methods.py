@@ -11,7 +11,6 @@ from statsmodels.formula.api import ols
 from numpy.random import Generator, PCG64
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss
-import numpy as np
 from bokeh.plotting import figure, show, save, output_file
 from bokeh.layouts import column as bcol, row as brow   
 from bokeh.models import ColumnDataSource, Div
@@ -31,6 +30,15 @@ from sklearn.manifold import MDS
 from sklearn.cluster import KMeans
 from statsmodels.tools.sm_exceptions import PerfectSeparationError, ConvergenceWarning
 import config
+from scipy.stats import multivariate_t
+from collections import Counter
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from joblib import Parallel, delayed
+from sklearn.cluster import MeanShift, estimate_bandwidth
+import itertools
+import ast
+from sklearn.cluster import DBSCAN
+from sklearn.svm import SVC
 
 def v2_defined_all_trees(n: int):
     """Return a list of all ND trees over labels 0..n-1 (each tree is a tuple of splits)."""
@@ -71,7 +79,168 @@ def tree_signatures(tree):
     """
     return frozenset(_canon_split(a, b) for (a, b) in tree)
 
-def split_loglik_star_sm(X, y, split, maxiter=2000, eps=1e-12):
+import numpy as np
+from scipy.stats import multivariate_t
+import config
+
+
+import numpy as np
+from scipy.stats import multivariate_t
+import config
+
+
+def split_loglik_star_lda(X, y, split, eps=1e-12):
+    """
+    Node log-likelihood for split (A, B) using Bayesian discriminant analysis.
+
+    Two super-classes at this node:
+      left_side  = classes in A (label 0)
+      right_side = classes in B (label 1)
+
+    Returns:
+      float node_loglik = sum_i [ s_i log p_right(x_i) + (1 - s_i) log p_left(x_i) ]
+    """
+    A, B = split
+    X = np.asarray(X)
+    y = np.asarray(y)
+
+    # Data that reach this node
+    mask_node = np.isin(y, A + B)
+    if not np.any(mask_node):
+        return 0.0
+
+    X_node = X[mask_node]
+    y_node = y[mask_node]
+
+    # side = 1 if class in B (right), 0 if in A (left)
+    side = np.isin(y_node, B).astype(int)
+    if side.min() == side.max():
+        # All on one side -> treat as degenerate, return 0.0
+        return 0.0
+
+    n_points, n_features = X_node.shape
+
+    # Simple Normal-Inverse-Wishart prior at this node
+    mean_prior = X_node.mean(axis=0)
+    kappa_prior = 1.0
+    nu_prior = n_features + 2.0
+    scale_prior = np.identity(n_features)
+
+    def posterior_predictive_params(X_side):
+        """Posterior predictive Student-t parameters for one side."""
+        n_side = X_side.shape[0]
+        if n_side > 0:
+            mean_side = X_side.mean(axis=0)
+            Xm = X_side - mean_side
+            scatter = np.dot(Xm.T, Xm)
+
+            kappa_post = kappa_prior + n_side
+            nu_post = nu_prior + n_side
+            mean_post = (kappa_prior * mean_prior + n_side * mean_side) / kappa_post
+
+            diff = mean_side - mean_prior
+            diff_outer = np.outer(diff, diff)
+
+            scale_post = scale_prior + scatter + (kappa_prior * n_side / kappa_post) * diff_outer
+        else:
+            kappa_post = kappa_prior
+            nu_post = nu_prior
+            mean_post = mean_prior
+            scale_post = scale_prior
+
+        degrees_of_freedom = float(nu_post - n_features + 1.0)
+        if degrees_of_freedom <= 0.0:
+            degrees_of_freedom = n_features + 1.0
+
+        scale_t = scale_post * (kappa_post + 1.0) / (kappa_post * degrees_of_freedom)
+        scale_t = scale_t + 1e-8 * np.identity(n_features)
+
+        return mean_post, scale_t, degrees_of_freedom, n_side
+
+    # Split node data into left and right (local only, not cached)
+    X_left = X_node[side == 0]
+    X_right = X_node[side == 1]
+
+    mean_left, scale_left, dof_left, n_left = posterior_predictive_params(X_left)
+    mean_right, scale_right, dof_right, n_right = posterior_predictive_params(X_right)
+
+    # Dirichlet(1,1) prior on class weights -> posterior mean weights
+    weight_left = 1.0 + n_left
+    weight_right = 1.0 + n_right
+    total_weight = weight_left + weight_right
+    log_weight_left = np.log(weight_left) - np.log(total_weight)
+    log_weight_right = np.log(weight_right) - np.log(total_weight)
+
+    # Student-t predictive log densities for all node points
+    log_density_left = multivariate_t.logpdf(
+        X_node, loc=mean_left, shape=scale_left, df=dof_left
+    )
+    log_density_right = multivariate_t.logpdf(
+        X_node, loc=mean_right, shape=scale_right, df=dof_right
+    )
+
+    # log(weight_k) + log f_k(x)
+    log_num_left = log_weight_left + log_density_left
+    log_num_right = log_weight_right + log_density_right
+
+    # log evidence via log-sum-exp
+    log_den = np.logaddexp(log_num_left, log_num_right)
+
+    # log p_right(x) and log p_left(x), clipped for numerical safety
+    log_p_right = np.clip(log_num_right - log_den, np.log(eps), -np.log(eps))
+    log_p_left = np.clip(log_num_left - log_den, np.log(eps), -np.log(eps))
+
+    # Bernoulli log-likelihood at this node (average per point)
+    log_terms = side * log_p_right + (1 - side) * log_p_left
+    # node_loglik = log_terms.mean()
+    node_loglik = log_terms.sum()
+
+    # Weighted node log-likelihood:
+    #   node_loglik_mean = average log-lik at this node
+    #   node_weight      = n_node ** gamma, with gamma in [0,1]
+    n_node = log_terms.size
+
+    gamma = getattr(config, "node_weight_power", 0.4)  # set in config, e.g. 0.5
+    node_loglik_mean = log_terms.mean()
+    node_weight = n_node ** gamma
+
+    node_loglik = node_weight * node_loglik_mean
+
+    # Minimal cached model for later prediction at this node
+    config.model_cache[split] = {
+        "mean": np.vstack([mean_left, mean_right]),          # shape (2, n_features)
+        "scale": np.stack([scale_left, scale_right]),         # shape (2, n_features, n_features)
+        "dof": np.array([dof_left, dof_right]),               # degrees of freedom per side
+        "log_weight": np.array([log_weight_left, log_weight_right]),
+    }
+
+    return float(node_loglik)
+
+def delta_loglik_lda(X, y, sig_T, sig_Tstar):
+    """Compute log L(T*) - log L(T) by only evaluating splits in the symmetric difference."""
+    add = sig_Tstar - sig_T
+    add_vals = []
+    rem = sig_T - sig_Tstar
+    rem_vals = []
+    
+    for s in add:
+        if s not in config.cache:
+            log_lik = split_loglik_star_lda(X, y, s)
+            config.cache[s] = log_lik
+        else: 
+            log_lik = config.cache[s]
+        add_vals.append(log_lik)
+    for s in rem:
+        if s not in config.cache:
+            log_lik = split_loglik_star_lda(X, y, s)
+            config.cache[s] = log_lik
+        else: 
+            log_lik = config.cache[s]
+        rem_vals.append(log_lik)
+    
+    return sum(add_vals) - sum(rem_vals)
+
+def split_loglik_star_sm(X, y, split, maxiter=2000, eps=1e-12, model='lr'):
     """
     ℓ*(split) using statsmodels Logit (unpenalized MLE).
     Returns the node log-likelihood at the MLE (float).
@@ -88,7 +257,17 @@ def split_loglik_star_sm(X, y, split, maxiter=2000, eps=1e-12):
 
     try: 
         # Direct log-likelihood at the MLE:
-        lr = LogisticRegression(penalty="l2", C=0.1, solver="newton-cholesky", max_iter=maxiter, fit_intercept=True)
+        if model == 'lr':
+            lr = LogisticRegression(penalty="l2", C=0.1, solver="newton-cholesky", max_iter=maxiter, fit_intercept=True)
+        elif model == 'svm':
+            lr = SVC(
+                kernel="rbf",
+                C=1.0,
+                gamma="scale",
+                probability=True,  # Platt calibration inside
+                max_iter=maxiter, # -1 = no limit
+            )
+
         lr.fit(X[mask], s)
         config.model_cache[split] = lr
         p = lr.predict_proba(X[mask])[:, 1]
@@ -103,7 +282,7 @@ def split_loglik_star_sm(X, y, split, maxiter=2000, eps=1e-12):
         p = np.clip(sm.Logit(s, Xsub).fit_regularized(alpha=1e-6, L1_wt=0.0, maxiter=maxiter).predict(), eps, 1-eps)
         return float((s*np.log(p) + (1-s)*np.log(1-p)).sum())
 
-def delta_loglik(X, y, sig_T, sig_Tstar):
+def delta_loglik(X, y, sig_T, sig_Tstar, model='lr'):
     """Compute log L(T*) - log L(T) by only evaluating splits in the symmetric difference."""
     add = sig_Tstar - sig_T
     add_vals = []
@@ -112,14 +291,14 @@ def delta_loglik(X, y, sig_T, sig_Tstar):
     
     for s in add:
         if s not in config.cache:
-            log_lik = split_loglik_star_sm(X, y, s)
+            log_lik = split_loglik_star_sm(X, y, s, model=model)
             config.cache[s] = log_lik
         else: 
             log_lik = config.cache[s]
         add_vals.append(log_lik)
     for s in rem:
         if s not in config.cache:
-            log_lik = split_loglik_star_sm(X, y, s)
+            log_lik = split_loglik_star_sm(X, y, s, model=model)
             config.cache[s] = log_lik
         else: 
             log_lik = config.cache[s]
@@ -131,16 +310,21 @@ def non_unif_local_swap(T, rg, alpha = 0.5):
     all_splits = list(T)
     eligible_splits = [x for x in all_splits if len(x[0]) > 1 or len(x[1]) > 1]
 
-    node_to_perform_on = random.choices(
-        eligible_splits,
-        weights=[1 / (len(a) + len(b))**alpha for a, b in eligible_splits],
-        k=1
-    )[0]
+    # node_to_perform_on = random.choices(
+    #     eligible_splits,
+    #     weights=[1 / (len(a) + len(b))**alpha for a, b in eligible_splits],
+    #     k=1
+    # )[0]
+
+    weights = np.array([1.0 / (len(a) + len(b))**alpha for a, b in eligible_splits], dtype=float)
+    weights = weights / weights.sum()
+    idx = rg.choice(len(eligible_splits), p=weights)
+    node_to_perform_on = eligible_splits[idx]
     # local_item_swap
     L = list(node_to_perform_on[0])
     R = list(node_to_perform_on[1])
-    left_swap = random.sample(L, 1)[0]
-    right_swap = random.sample(R, 1)[0]
+    left_swap = rg.choice(L)
+    right_swap = rg.choice(R)
     # print(f"Swapping {left_swap} with {right_swap}")
     # print(f"Original node: {node_to_perform_on}")
     L.remove(left_swap)
@@ -176,11 +360,16 @@ def non_unif_entire_node_swap(T, rg, alpha = 0.5):
     all_splits = list(T)
     eligible_splits = [x for x in all_splits if len(x[0]) > 1 or len(x[1]) > 1]
     
-    node_to_perform_on = random.choices(
-        eligible_splits,
-        weights=[1 / (len(a) + len(b))**alpha for a, b in eligible_splits],
-        k=1
-    )[0]
+    # node_to_perform_on = random.choices(
+    #     eligible_splits,
+    #     weights=[1 / (len(a) + len(b))**alpha for a, b in eligible_splits],
+    #     k=1
+    # )[0]
+    weights = np.array([1.0 / (len(a) + len(b))**alpha for a, b in eligible_splits], dtype=float)
+    weights = weights / weights.sum()
+    idx = rg.choice(len(eligible_splits), p=weights)
+    node_to_perform_on = eligible_splits[idx]
+    
     total_possible += math.comb(len(eligible_splits), 1)
     node_choices = len(eligible_splits)
     S = set(node_to_perform_on[0]) | set(node_to_perform_on[1])
@@ -189,11 +378,11 @@ def non_unif_entire_node_swap(T, rg, alpha = 0.5):
     # entire node swap
     L = list(node_to_perform_on[0])
     R = list(node_to_perform_on[1])
-    all_classes = set(L + R)
+    all_classes = list(set(L + R))
     number_of_classes = len(all_classes)
-    left_split_size = random.choice(range(1,number_of_classes))
+    left_split_size = int(rg.integers(1, number_of_classes))
     # total_possible += factorial2(2*number_of_classes - 3)
-    new_L = sorted(random.sample(list(all_classes), left_split_size))
+    new_L = sorted(rg.choice(all_classes, size=left_split_size, replace=False).tolist())
     new_R = sorted(list(set(all_classes) - set(new_L)))
     new_node = (tuple(new_L), tuple(new_R))
     T = list(T)
@@ -213,8 +402,8 @@ def non_unif_entire_node_swap(T, rg, alpha = 0.5):
         n = len(classes)
         if n <= 1:
             return [], 1.0
-        l_split_size = random.choice(range(1,n))                  
-        A = set(random.sample(classes, l_split_size))
+        l_split_size = int(rg.integers(1, n))  # 1..n-1                  
+        A = set(rg.choice(classes, size=l_split_size, replace=False).tolist())
         B = set(classes) - A
         c = [A, B]
         c.sort(key=len, reverse=True)
@@ -241,12 +430,21 @@ def non_unif_entire_node_swap(T, rg, alpha = 0.5):
     g_fwd = (1.0 / node_choices) * g_top * p_left * p_right
     return gd.bfs_splits(T), g_fwd, g_rev
 
-def tree_loglik(X, y, T):
+def tree_loglik_lda(X, y, T):
 # sum node log-likelihoods (cached), using existing split scorer
     s = 0.0
     for split in T:
         if split not in config.cache:
-            config.cache[split] = split_loglik_star_sm(X, y, split)
+            config.cache[split] = split_loglik_star_lda(X, y, split)
+        s += config.cache[split]
+    return s
+
+def tree_loglik(X, y, T, model='lr'):
+# sum node log-likelihoods (cached), using existing split scorer
+    s = 0.0
+    for split in T:
+        if split not in config.cache:
+            config.cache[split] = split_loglik_star_sm(X, y, split, model=model)
         s += config.cache[split]
     return s
 
@@ -362,8 +560,8 @@ def init_tree_n(n_classes, rng):
         n = len(classes)
         if n <= 1:
             return []
-        l_split_size = random.choice(range(1,n))                  
-        A = set(random.sample(classes, l_split_size))
+        l_split_size = int(rng.integers(1, n))
+        A = set(rng.choice(classes, size=l_split_size, replace=False).tolist())
         B = set(classes) - A
         left_splits = grow(A)
         right_splits= grow(B)
@@ -372,7 +570,7 @@ def init_tree_n(n_classes, rng):
 
     return grow(range(0, n_classes))
 
-def mh_dep_non_unif_node_trees(X, y, n_samples, categories, rng_seed=42, alpha = 0.5, eta_thresh=0.6):
+def mh_dep_non_unif_node_trees_lda(X, y, n_samples, categories, rng_seed=42, alpha = 0.5, eta_thresh=0.6):
     """
     trees: list of ND trees (tuples (left_set, right_set, left_child, right_child))
     g: proposal pmf over the library (shape M), fixed (independence)
@@ -382,7 +580,36 @@ def mh_dep_non_unif_node_trees(X, y, n_samples, categories, rng_seed=42, alpha =
     rng = Generator(PCG64(rng_seed))
 
     T = tuple(init_tree_n(categories, rng))
-    T = tuple(gd.breadth_first_splits(T))
+    T = tuple(gd.bfs_splits(T))
+    trace = np.empty(n_samples, dtype=object)
+    all_tested_trees = set()
+    all_tested_trees.add(T)
+    for t in range(n_samples):
+        eta = rng.uniform(0, 1)
+        if eta < eta_thresh:
+            T_star, gdiff = non_unif_local_swap(T, rng, alpha)
+        else:
+            T_star, gfwd, grev = non_unif_entire_node_swap(T, rng, alpha)
+            gdiff = np.log(grev) - np.log(gfwd)
+        all_tested_trees.add(T_star)
+        dLL  = delta_loglik_lda(X, y, tree_signatures(T), tree_signatures(T_star))
+        logR = dLL + gdiff   # MH accept log-ratio
+        if np.log(rng.random()) < min(0.0, logR):
+            T = T_star
+        trace[t] = T
+    return trace, all_tested_trees, config.cache
+
+def mh_dep_non_unif_node_trees(X, y, n_samples, categories, rng_seed=42, alpha = 0.5, eta_thresh=0.6, model='lr'):
+    """
+    trees: list of ND trees (tuples (left_set, right_set, left_child, right_child))
+    g: proposal pmf over the library (shape M), fixed (independence)
+    X (n,p), y (n,)
+    Returns: indices trace (n_samples,), optional cache for reuse/diagnostics
+    """
+    rng = Generator(PCG64(rng_seed))
+
+    T = tuple(init_tree_n(categories, rng))
+    T = tuple(gd.bfs_splits(T))
     trace = np.empty(n_samples, dtype=object)
     all_tested_trees = set()
     all_tested_trees.add(T)
@@ -395,7 +622,7 @@ def mh_dep_non_unif_node_trees(X, y, n_samples, categories, rng_seed=42, alpha =
             T_star, gfwd, grev = non_unif_entire_node_swap(T, rng, alpha)
             gdiff = np.log(grev) - np.log(gfwd)
         all_tested_trees.add(T_star)
-        dLL  = delta_loglik(X, y, tree_signatures(T), tree_signatures(T_star))  # likelihood function
+        dLL  = delta_loglik(X, y, tree_signatures(T), tree_signatures(T_star), model)
         logR = dLL + gdiff   # MH accept log-ratio
         if np.log(rng.random()) < min(0.0, logR):
             T = T_star
@@ -510,6 +737,151 @@ def embed_tree(df, embeding):
     df = df.sort_values(by='tree_encoded')
     return df
 
+def get_or_train_split_model(left, right, base="lr"):
+    key = (base, tuple(left), tuple(right))
+    cache = config.model_cache
+    if key in cache:
+        return cache[key]
+
+    X_tr = np.asarray(config.X)
+    y_tr = np.asarray(config.y)
+
+    node_classes = tuple(left) + tuple(right)
+    mask = np.isin(y_tr, node_classes)
+    X_node = X_tr[mask]
+    y_raw = y_tr[mask]
+
+    is_left = np.isin(y_raw, left)
+    y_node = np.where(is_left, 0, 1)
+
+    if base == "lr":
+        model = LogisticRegression(
+            penalty="l2",
+            solver="newton-cholesky",
+            C=getattr(config, "C", 0.1),
+            max_iter=2000,
+        )
+    elif base == "lda":
+        model = LinearDiscriminantAnalysis()
+    elif base == "svm":
+        model = SVC(
+                kernel="rbf",
+                C=1.0,
+                gamma="scale",
+                probability=True,  # Platt calibration inside
+                max_iter=2000, # -1 = no limit
+            )
+    else:
+        raise ValueError("base must be 'lr' or 'lda'.")
+
+    model.fit(X_node, y_node)
+    cache[key] = model
+    return model
+
+def nd_predict_proba(X, T, classes, base="lr"):
+    X = np.asarray(X)
+    class_to_idx = {c: i for i, c in enumerate(classes)}
+    n_samples = X.shape[0]
+    n_classes = len(classes)
+    proba = np.ones((n_samples, n_classes), dtype=float)
+
+    for left, right in T:
+        model = get_or_train_split_model(left, right, base=base)
+        p_node = model.predict_proba(X)
+        p_left = p_node[:, 0]
+        p_right = p_node[:, 1]
+
+        li = [class_to_idx[c] for c in left]
+        ri = [class_to_idx[c] for c in right]
+
+        proba[:, li] = proba[:, li] * p_left[:, None]
+        proba[:, ri] = proba[:, ri] * p_right[:, None]
+
+    row_sums = proba.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0.0] = 1.0
+    proba = proba / row_sums
+    return proba, classes
+
+def nd_predict(X, T, classes, base="lr"):
+    proba, classes_out = nd_predict_proba(X, T, classes, base=base)
+    idx = proba.argmax(axis=1)
+    return np.asarray(classes_out)[idx]
+
+def nd_logloss(X, y, T, classes, base="lr"):
+    proba, classes_out = nd_predict_proba(X, T, classes, base=base)
+    y_arr = np.asarray(y)
+    return log_loss(y_arr, proba, labels=classes_out)
+
+# ---------- BMA from MH traces ----------
+
+def collect_posterior_trees(traces, burn_in=0.5, thin=10):
+    samples = []
+    for trace in traces:
+        seq = list(trace)
+        n = len(seq)
+        if n == 0:
+            continue
+        if 0 < burn_in < 1:
+            start = int(burn_in * n)
+        else:
+            start = int(burn_in)
+        if start >= n:
+            continue
+        if thin > 1:
+            samples.extend(seq[start::thin])
+        else:
+            samples.extend(seq[start:])
+
+    if not samples:
+        raise ValueError("No samples after burn-in/thinning.")
+
+    counts = Counter(samples)
+    trees = list(counts.keys())
+    counts_arr = np.array([counts[t] for t in trees], dtype=float)
+    total = counts_arr.sum()
+    if total <= 0.0:
+        raise ValueError("Non-positive total count.")
+    weights = counts_arr / total
+    return trees, weights
+
+def bma_predict_proba(X, trees, weights, classes, base="lr"):
+    X = np.asarray(X)
+    weights = np.asarray(weights, dtype=float)
+
+    # run nd_predict_proba for each tree in parallel
+    results = Parallel(n_jobs=-1, backend="threading")(
+        delayed(nd_predict_proba)(X, tree, classes, base=base)
+        for tree in trees
+    )
+    # each result is (proba_tree, classes); take the probas
+    probas = [r[0] for r in results]
+
+    proba_bma = np.zeros_like(probas[0], dtype=float)
+    for w, p in zip(weights, probas):
+        proba_bma = proba_bma + w * p
+
+    return proba_bma, classes
+
+def bma_logloss(X, y, trees, weights, classes, base="lr"):
+    proba_bma, classes_out = bma_predict_proba(X, trees, weights, classes, base=base)
+    y_arr = np.asarray(y)
+    return log_loss(y_arr, proba_bma, labels=classes_out)
+
+# ---------- Score-based ensemble from df_all (tree, score) ----------
+
+def trees_weights_from_df(df_all):
+    trees = list(df_all["tree"])
+    scores = np.asarray(df_all["score"], dtype=float)
+    if scores.size == 0:
+        raise ValueError("df_all is empty.")
+    max_score = scores.max()
+    w_unnorm = np.exp(scores - max_score)
+    total = w_unnorm.sum()
+    if total <= 0.0:
+        raise ValueError("Non-positive total weight.")
+    weights = w_unnorm / total
+    return trees, weights
+
 def html_similarity_scatter(df, embeding="newick", ngram_range=(2,4), n_clusters=4, to_html=None, analyzer=None, tokenize=None, vec=None, cards_per_row=None):
 
     # Newick → TF-IDF → cosine similarity
@@ -534,7 +906,22 @@ def html_similarity_scatter(df, embeding="newick", ngram_range=(2,4), n_clusters
 
     # MDS: finds 2D coords whose Euclidean distances best match the given distance matrix
     coords = MDS(n_components=2, dissimilarity="precomputed", random_state=0).fit_transform(D)
-    labels = KMeans(n_clusters=n_clusters, n_init=20, random_state=0).fit_predict(coords)
+    # labels = KMeans(n_clusters=n_clusters, n_init=20, random_state=0).fit_predict(coords)
+    # labels = MeanShift(bandwidth=estimate_bandwidth(coords)).fit_predict(coords)
+    best_score = -1.0
+    labels = None
+    n_points = len(newicks)
+    n_clusters = 0
+    
+    k_max = min(20, int(n_points/2))
+    for k in range(4,k_max):   # small fixed range
+        km = KMeans(n_clusters=k, n_init=10, random_state=0)
+        lab = km.fit_predict(coords)
+        score = silhouette_score(coords, lab)
+        if score > best_score:
+            best_score = score
+            labels = lab
+            n_clusters = k
 
     all_vals = check_label_fit(labels, df["score"].to_numpy(float), coords)
     r2_in_sample, eta_sq, omega_sq, icc, sil = all_vals["r2_in_sample"], all_vals["eta_sq"], all_vals["omega_sq"], all_vals["icc"], all_vals["sil"]
@@ -688,11 +1075,11 @@ def html_similarity_scatter(df, embeding="newick", ngram_range=(2,4), n_clusters
     if to_html is not None:
         output_file(to_html); 
         save(layout)
-        show(layout)
+        # show(layout)
 
     return S, coords
 
-def viz_mh_trace(traces, X, y, burn=0, top_k=20, html_path=None, best_known=None, loglik_fn=None, notes=""):
+def viz_mh_trace(traces, X, y, burn=0, top_k=20, html_path=None, best_known=None, loglik_fn=None, notes="", model=None):
     try: L = min(len(t) for t in traces); arr = np.stack([np.asarray(t[:L], object) for t in traces], 0)
     except Exception: arr = np.asarray(traces, object)[None, :]
 
@@ -710,7 +1097,7 @@ def viz_mh_trace(traces, X, y, burn=0, top_k=20, html_path=None, best_known=None
     labels = [str(int(i)) for i in top_ids]
     top_trees = [uniq_trees[int(i)] for i in top_ids]
 
-    _ll = (lambda T: float(loglik_fn(X, y, T))) if loglik_fn else (lambda T: None)
+    _ll = (lambda T: float(loglik_fn(X, y, T, model=model))) if loglik_fn else (lambda T: None)
     bk_ll = _ll(best_known) if (best_known is not None) else None
     top_lls = [_ll(T) for T in top_trees]
     if loglik_fn and any(ll is not None for ll in top_lls):
@@ -801,3 +1188,35 @@ def viz_mh_trace(traces, X, y, burn=0, top_k=20, html_path=None, best_known=None
         "best_found_id": best_found_id, "best_found_ll": best_found_ll, "best_found_tree": best_found_tree,
         "best_known_ll": bk_ll
     }
+    
+def make_split_analyzer(NUMBER_OF_CLASSES):
+    def split_analyzer(doc):
+        splits = ast.literal_eval(doc) if isinstance(doc, str) else doc
+        max_depth = max(5, NUMBER_OF_CLASSES - 4)
+        toks = []
+        for d, (L, R) in enumerate(splits):
+            if d > max_depth:
+                break
+
+            L = tuple(sorted(L))
+            R = tuple(sorted(R))
+            c = [L, R]
+            c.sort(key=len, reverse=True)
+            A = c[0]
+            B = c[1]
+            new_less = min(1, (NUMBER_OF_CLASSES - 3) - d)
+            new = (NUMBER_OF_CLASSES - 1) - d
+
+            toks.extend([f"split:{A}|{B}"])
+            toks.extend([f"sz:{len(A)}|{len(B)}"] * new)
+
+            toks.extend([f"group:{A}"] * len(A))
+            toks.extend([f"group:{B}"] * len(B))
+
+            # encourage grouping via co-membership pairs
+            for side in (A, B):
+                for i, j in itertools.combinations(side, 2):
+                    toks.extend([f"pair:{i}-{j}"] * new_less)
+        return toks
+
+    return split_analyzer
