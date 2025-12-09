@@ -430,7 +430,7 @@ def non_unif_entire_node_swap(T, rg, alpha = 0.5):
     g_fwd = (1.0 / node_choices) * g_top * p_left * p_right
     return gd.bfs_splits(T), g_fwd, g_rev
 
-def tree_loglik_lda(X, y, T):
+def tree_loglik_lda(X, y, T, model=None):
 # sum node log-likelihoods (cached), using existing split scorer
     s = 0.0
     for split in T:
