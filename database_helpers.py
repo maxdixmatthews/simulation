@@ -14,7 +14,7 @@ def get_next_job(conn):
                 """
                 SELECT *
                 FROM nd_job_queue
-                WHERE status = 'pending' and ROUND(train_test_ratio::numeric, 2) = 0.2 and seed in (41, 42) and models in ('lda')
+                WHERE status = 'pending' and ROUND(train_test_ratio::numeric, 2) = 0.2 and seed in (41, 42) and models in ('lr', 'lda') and dataset LIKE '%hospital%'
                 ORDER BY created_at DESC
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1

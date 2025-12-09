@@ -139,8 +139,10 @@ def run_model(job: dict) -> pd.DataFrame:
     rss_bytes = psutil.Process(os.getpid()).memory_info().rss
     
     if rss_bytes < 2 * 1024**3:
+        pass
         # config_state = {name: getattr(config, name) for name in ["model_cache", "cache", "categories"]}
     else:
+        pass
         # config_state = {name: getattr(config, name) for name in ["cache", "categories"]}
         
     # dump(config_state, artifacts_path + f"\\config\\{config_name}", compress=3)
